@@ -1,467 +1,311 @@
-import cv2  # type: ignore
-import mediapipe as mp  # type: ignore
+import streamlit as st
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode, RTCConfiguration
+import cv2
+import mediapipe as mp
 import time
-import pyttsx3
-import threading
-import numpy as np
-import sys
-import math
+import queue
 from collections import deque, Counter
 
+from utils.recognizer import classify_gesture
+from utils.speech import speak_text
+
+st.set_page_config(page_title="SignBridge Web-Pro", page_icon="🤟", layout="wide")
 
 # ============================================================
-# SPEECH ENGINE
+# PREMIUM GLASSMORPHIC DESIGN SYSTEM
 # ============================================================
-def speak_text_thread(text):
-    """Speak text in a fresh thread to avoid pyttsx3 hanging on Windows."""
-    if sys.platform == 'win32':
-        try:
-            import pythoncom  # type: ignore
-            pythoncom.CoInitialize()
-        except Exception as e:
-            print(f"[Speech] pythoncom error: {e}")
-
-    try:
-        engine = pyttsx3.init()
-        engine.setProperty('volume', 1.0)
-        engine.setProperty('rate', 150)
-        print(f"[Speech] Speaking: {text}")
-        engine.say(text)
-        engine.runAndWait()
-        print(f"[Speech] Finished: {text}")
-    except Exception as e:
-        print(f"[Speech] Error: {e}")
-
-
-def speak_text(text):
-    """Non-blocking speech call."""
-    threading.Thread(target=speak_text_thread, args=(text,), daemon=True).start()
-
-
-# ============================================================
-# LANDMARK HELPERS  (Angle-Based, Rotation-Invariant)
-# ============================================================
-def get_landmark_array(hand_landmarks):
-    """Convert MediaPipe landmarks to a NumPy (21, 3) array."""
-    pts = []
-    for lm in hand_landmarks.landmark:
-        pts.append([lm.x, lm.y, lm.z])
-    return np.array(pts)
-
-
-def angle_between(v1, v2):
-    """Return the angle in degrees between two 3-D vectors."""
-    cos = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-8)
-    cos = np.clip(cos, -1.0, 1.0)
-    return math.degrees(math.acos(cos))
-
-
-def finger_curl_angle(pts, mcp, pip, tip):
-    """
-    Compute the curl angle of a finger.
-    A straight finger ≈ 180°;  a fully curled finger ≈ 0–60°.
-    Uses the angle at the PIP joint between the MCP→PIP and PIP→TIP vectors.
-    """
-    v1 = pts[mcp] - pts[pip]
-    v2 = pts[tip] - pts[pip]
-    return angle_between(v1, v2)
-
-
-def finger_is_extended(pts, mcp, pip, dip, tip, threshold=140):
-    """
-    A finger is considered 'extended' if the angle at the PIP joint
-    is greater than the threshold (roughly straight).
-    """
-    return finger_curl_angle(pts, mcp, pip, tip) > threshold
-
-
-def thumb_is_extended(pts, handedness):
-    """
-    Thumb extension uses a combination of:
-      1. The angle at the IP joint (landmarks 2→3→4).
-      2. Whether the thumb tip (4) is far from the index MCP (5)
-         in the lateral (x) direction.
-    """
-    angle = finger_curl_angle(pts, 2, 3, 4)
-    dist = np.linalg.norm(pts[4] - pts[5])
-    return angle > 120 and dist > 0.06
-
-
-def thumb_is_across_palm(pts, handedness):
-    """
-    Check if the thumb tip sits across the palm (touching index/middle area).
-    Used to distinguish A from S, etc.
-    """
-    # thumb tip closer to middle-finger MCP than to its own CMC
-    return np.linalg.norm(pts[4] - pts[9]) < np.linalg.norm(pts[4] - pts[2])
-
-
-def fingers_spread(pts, f1_tip, f2_tip, threshold=0.06):
-    """Check if two fingertips are spread apart."""
-    return np.linalg.norm(pts[f1_tip] - pts[f2_tip]) > threshold
-
-
-def fingertips_touching(pts, tip_a, tip_b, threshold=0.04):
-    """Check if two landmarks are close together (touching)."""
-    return np.linalg.norm(pts[tip_a] - pts[tip_b]) < threshold
-
+st.markdown("""
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap');
+    
+    html, body, [class*="css"]  {
+        font-family: 'Inter', sans-serif;
+    }
+    
+    .stApp {
+        background: linear-gradient(135deg, #0f111a 0%, #1a1d2e 100%);
+        color: #ffffff;
+    }
+    
+    /* Hide top bar */
+    header {visibility: hidden;}
+    
+    .glass-panel {
+        background: rgba(255, 255, 255, 0.03);
+        backdrop-filter: blur(16px);
+        -webkit-backdrop-filter: blur(16px);
+        border: 1px solid rgba(255, 255, 255, 0.05);
+        border-radius: 20px;
+        padding: 24px;
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+        margin-bottom: 20px;
+    }
+    
+    .word-buffer {
+        font-size: 3.5rem;
+        font-weight: 800;
+        color: #00E676;
+        letter-spacing: 4px;
+        min-height: 90px;
+        text-align: center;
+        border-bottom: 2px solid rgba(0, 230, 118, 0.3);
+        padding: 20px;
+        margin-bottom: 10px;
+        text-shadow: 0 0 20px rgba(0, 230, 118, 0.2);
+    }
+    
+    .hud-letter {
+        font-size: 10rem;
+        font-weight: 800;
+        text-align: center;
+        color: #ffffff;
+        text-shadow: 0 0 30px rgba(255,255,255,0.4);
+        margin: 0;
+        line-height: 1.2;
+    }
+    
+    .stButton > button {
+        background: rgba(0, 230, 118, 0.1);
+        border: 1px solid rgba(0, 230, 118, 0.5);
+        color: #00E676;
+        border-radius: 12px;
+        font-weight: 600;
+        padding: 12px 24px;
+        transition: all 0.3s ease;
+        height: auto;
+    }
+    
+    .stButton > button:hover {
+        background: #00E676;
+        color: #0f111a;
+        box-shadow: 0 0 20px rgba(0, 230, 118, 0.4);
+        border-color: #00E676;
+    }
+    
+    .stProgress > div > div > div {
+        background-color: #00E676;
+    }
+    
+    hr {
+        border-color: rgba(255, 255, 255, 0.1);
+    }
+</style>
+""", unsafe_allow_html=True)
 
 # ============================================================
-# GESTURE CLASSIFICATION  (Angle-Based Heuristics)
+# STATE MANAGEMENT
 # ============================================================
-# MediaPipe hand landmark indices:
-#   Thumb:  1(CMC)  2(MCP)  3(IP)   4(TIP)
-#   Index:  5(MCP)  6(PIP)  7(DIP)  8(TIP)
-#   Middle: 9(MCP) 10(PIP) 11(DIP) 12(TIP)
-#   Ring:  13(MCP) 14(PIP) 15(DIP) 16(TIP)
-#   Pinky: 17(MCP) 18(PIP) 19(DIP) 20(TIP)
+if "word_buffer" not in st.session_state:
+    st.session_state.word_buffer = ""
+if "history" not in st.session_state:
+    st.session_state.history = []
 
-def classify_gesture(hand_landmarks, handedness):
-    """
-    Classify ASL static gestures using angle-based heuristics.
-    Supports: A, B, C, D, E, F, I, K, L, O, U, V, W, Y
-    """
-    pts = get_landmark_array(hand_landmarks)
+# ============================================================
+# VIDEO PROCESSING ENGINE (MediaPipe)
+# ============================================================
 
-    # --- Finger states ---
-    index_ext  = finger_is_extended(pts, 5, 6, 7, 8)
-    middle_ext = finger_is_extended(pts, 9, 10, 11, 12)
-    ring_ext   = finger_is_extended(pts, 13, 14, 15, 16)
-    pinky_ext  = finger_is_extended(pts, 17, 18, 19, 20)
-    thumb_ext  = thumb_is_extended(pts, handedness)
+# Initialize MediaPipe globally to prevent threading/hot-reloading issues
+mp_hands_global = mp.solutions.hands
+mp_drawing_global = mp.solutions.drawing_utils
 
-    ext_count = sum([index_ext, middle_ext, ring_ext, pinky_ext])
+class SignProcessor(VideoProcessorBase):
+    def __init__(self):
+        self.mp_hands = mp_hands_global
+        self.hands = self.mp_hands.Hands(
+            model_complexity=0, 
+            min_detection_confidence=0.7, 
+            min_tracking_confidence=0.7, 
+            max_num_hands=1
+        )
+        self.mp_drawing = mp_drawing_global
+        self.history = deque(maxlen=12)
+        
+        self.current_letter = None
+        self.letter_start_time = None
+        self.already_spoken = False
+        self.hold_duration = 2.0
+        
+        # Thread-safe queue to pass letters back to the Streamlit UI thread
+        self.result_queue = queue.Queue()
+        
+        self.detected_letter = None
+        self.progress = 0.0
 
-    # --- Curl angles (for finer distinctions) ---
-    index_angle = finger_curl_angle(pts, 5, 6, 8)
+    def recv(self, frame):
+        import av
+        img = frame.to_ndarray(format="bgr24")
+        
+        # Mirror image for selfie view
+        img = cv2.flip(img, 1)
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        
+        # Process hand landmarks
+        rgb.flags.writeable = False
+        results = self.hands.process(rgb)
+        rgb.flags.writeable = True
+        
+        raw_letter = None
+        if results.multi_hand_landmarks and results.multi_handedness:
+            for hand_lm, hand_info in zip(results.multi_hand_landmarks, results.multi_handedness):
+                self.mp_drawing.draw_landmarks(
+                    img, hand_lm, self.mp_hands.HAND_CONNECTIONS,
+                    self.mp_drawing.DrawingSpec(color=(0, 230, 230), thickness=2, circle_radius=3),
+                    self.mp_drawing.DrawingSpec(color=(50, 50, 50), thickness=2)
+                )
+                label = hand_info.classification[0].label
+                raw_letter = classify_gesture(hand_lm, label)
+                
+        # Smoothing filter
+        self.history.append(raw_letter)
+        counter = Counter(self.history)
+        most_common = counter.most_common(1)
+        
+        if most_common:
+            smoothed, count = most_common[0]
+            self.detected_letter = smoothed if (count >= 7 and smoothed is not None) else None
+        else:
+            self.detected_letter = None
+            
+        # Time-based hold logic
+        now = time.time()
+        self.progress = 0.0
+        
+        if self.detected_letter:
+            if self.detected_letter == self.current_letter:
+                if not self.already_spoken and self.letter_start_time is not None:
+                    elapsed = now - self.letter_start_time
+                    self.progress = min(1.0, elapsed / self.hold_duration)
+                    
+                    # Target reached: Add to queue
+                    if elapsed >= self.hold_duration:
+                        self.result_queue.put(self.detected_letter)
+                        self.already_spoken = True
+            else:
+                self.current_letter = self.detected_letter
+                self.letter_start_time = now
+                self.already_spoken = False
+        else:
+            self.current_letter = None
+            self.letter_start_time = None
+            self.already_spoken = False
+            
+        return av.VideoFrame.from_ndarray(img, format="bgr24")
 
-    # Thumb lateral direction relative to index
-    if handedness == "Right":
-        thumb_lateral_out = pts[4][0] < pts[3][0] - 0.02
+# ============================================================
+# APP LAYOUT & UI
+# ============================================================
+st.markdown("<h1 style='text-align: center; color: #ffffff; margin-bottom: 0;'>SignBridge <span style='color: #00E676;'>Web-Pro</span> 🤟</h1>", unsafe_allow_html=True)
+st.markdown("<p style='text-align: center; color: #8892b0; margin-bottom: 30px; font-weight: 600;'>Advanced ASL Recognition Engine</p>", unsafe_allow_html=True)
+
+# SIDEBAR
+with st.sidebar:
+    st.markdown("<div class='glass-panel'>", unsafe_allow_html=True)
+    st.markdown("### ⚙️ Settings")
+    st.markdown("**Supported Gestures:**")
+    st.caption("A B C D E F I K L O U V W Y")
+    st.markdown("---")
+    st.markdown("### 📖 Session History")
+    
+    if len(st.session_state.history) == 0:
+        st.caption("No words spoken yet.")
     else:
-        thumb_lateral_out = pts[4][0] > pts[3][0] + 0.02
+        for w in reversed(st.session_state.history):
+            st.markdown(f"• **{w}**")
+            
+    st.markdown("</div>", unsafe_allow_html=True)
 
-    # -------------------------------------------------------
-    # CLASSIFICATION RULES  (ordered from most to least specific)
-    # -------------------------------------------------------
+# MAIN CONTENT
+col1, col2 = st.columns([2, 1])
 
-    # ----- W: Index + Middle + Ring extended, separated, pinky folded -----
-    if (index_ext and middle_ext and ring_ext
-            and not pinky_ext and not thumb_ext):
-        if (fingers_spread(pts, 8, 12) and fingers_spread(pts, 12, 16)):
-            return "W"
+with col1:
+    st.markdown("<div class='glass-panel'>", unsafe_allow_html=True)
+    
+    webrtc_ctx = webrtc_streamer(
+        key="signbridge",
+        mode=WebRtcMode.SENDRECV,
+        rtc_configuration=RTCConfiguration({
+            "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
+        }),
+        video_processor_factory=SignProcessor,
+        media_stream_constraints={"video": True, "audio": False},
+        async_processing=True,
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
 
-    # ----- F: Index tip touches thumb tip, other 3 fingers extended -----
-    if (middle_ext and ring_ext and pinky_ext
-            and fingertips_touching(pts, 4, 8, threshold=0.05)):
-        return "F"
+with col2:
+    st.markdown("<div class='glass-panel' style='min-height: 480px; display: flex; flex-direction: column; justify-content: center;'>", unsafe_allow_html=True)
+    st.markdown("<h4 style='text-align: center; color: #8892b0; margin-top: 0;'>CURRENT GESTURE</h4>", unsafe_allow_html=True)
+    
+    letter_placeholder = st.empty()
+    progress_placeholder = st.empty()
+    
+    # Default state
+    letter_placeholder.markdown("<div class='hud-letter' style='color: rgba(255,255,255,0.1);'>-</div>", unsafe_allow_html=True)
+    progress_placeholder.progress(0.0)
+    
+    st.markdown("</div>", unsafe_allow_html=True)
 
-    # ----- O: All fingertips curled toward thumb, forming a circle -----
-    if (not index_ext and not middle_ext and not ring_ext and not pinky_ext):
-        if (fingertips_touching(pts, 4, 8, threshold=0.06)
-                and index_angle < 120):
-            return "O"
+# WORD BUFFER & CONTROLS
+st.markdown("<div class='glass-panel'>", unsafe_allow_html=True)
+st.markdown("<p style='color: #8892b0; margin-bottom: 0; font-weight: 600;'>CONSTRUCTED WORD</p>", unsafe_allow_html=True)
 
-    # ----- D: Index extended, others curled, thumb touches middle -----
-    if (index_ext and not middle_ext and not ring_ext and not pinky_ext):
-        if not thumb_lateral_out:
-            if fingertips_touching(pts, 4, 12, threshold=0.06):
-                return "D"
+word_placeholder = st.empty()
+display_word = st.session_state.word_buffer if st.session_state.word_buffer else "_"
+word_placeholder.markdown(f"<div class='word-buffer'>{display_word}</div>", unsafe_allow_html=True)
 
-    # ----- K: Index up, middle up but angled, thumb between them -----
-    if (index_ext and not ring_ext and not pinky_ext):
-        mid_angle = finger_curl_angle(pts, 9, 10, 12)
-        if 90 < mid_angle < 150:  # middle partially extended
-            if (pts[4][1] < pts[10][1]):  # thumb tip above middle PIP
-                return "K"
+c1, c2, c3, c4 = st.columns(4)
 
-    # ----- L: Index extended, thumb out perpendicular, others folded -----
-    if (index_ext and not middle_ext and not ring_ext and not pinky_ext):
-        if thumb_ext and thumb_lateral_out:
-            return "L"
+if c1.button("␣ Add Space", use_container_width=True):
+    st.session_state.word_buffer += " "
+    
+if c2.button("⌫ Backspace", use_container_width=True):
+    st.session_state.word_buffer = st.session_state.word_buffer[:-1]
+    
+if c3.button("🗑️ Clear", use_container_width=True):
+    st.session_state.word_buffer = ""
+    
+if c4.button("🔊 Speak Word", use_container_width=True):
+    if st.session_state.word_buffer.strip():
+        speak_text(st.session_state.word_buffer)
+        st.session_state.history.append(st.session_state.word_buffer)
+        st.session_state.word_buffer = ""
+        st.rerun()
 
-    # ----- I: Only pinky extended, thumb tucked -----
-    if (not index_ext and not middle_ext and not ring_ext
-            and pinky_ext and not thumb_ext):
-        return "I"
-
-    # ----- U: Index + Middle extended and together, others folded -----
-    if (index_ext and middle_ext and not ring_ext and not pinky_ext):
-        if not thumb_ext:
-            if not fingers_spread(pts, 8, 12, threshold=0.05):
-                return "U"
-
-    # ----- V: Index + Middle extended and separated, others folded -----
-    if (index_ext and middle_ext and not ring_ext and not pinky_ext):
-        if not thumb_ext:
-            if fingers_spread(pts, 8, 12, threshold=0.05):
-                return "V"
-
-    # ----- Y: Thumb out, pinky extended, others folded -----
-    if (not index_ext and not middle_ext and not ring_ext
-            and pinky_ext and thumb_ext):
-        return "Y"
-
-    # ----- B: All 4 fingers extended, thumb tucked -----
-    if ext_count == 4 and (not thumb_ext or not thumb_lateral_out):
-        return "B"
-
-    # ----- E: All fingers curled into palm, thumb across the front -----
-    if (not index_ext and not middle_ext and not ring_ext
-            and not pinky_ext and not thumb_ext):
-        if thumb_is_across_palm(pts, handedness):
-            # Distinguish from A: in E all fingertips are near the palm
-            avg_tip_y = np.mean([pts[8][1], pts[12][1], pts[16][1], pts[20][1]])
-            avg_mcp_y = np.mean([pts[5][1], pts[9][1], pts[13][1], pts[17][1]])
-            if avg_tip_y < avg_mcp_y + 0.03:
-                return "E"
-
-    # ----- C: Fingers curved into a C-shape, thumb opposed -----
-    if (not index_ext and not middle_ext and not ring_ext and not pinky_ext):
-        if thumb_ext or thumb_lateral_out:
-            if 60 < index_angle < 150:
-                return "C"
-
-    # ----- A: Fist with thumb alongside (not across palm) -----
-    if (not index_ext and not middle_ext and not ring_ext
-            and not pinky_ext):
-        if not thumb_is_across_palm(pts, handedness):
-            if pts[4][1] < pts[5][1]:  # thumb tip above index MCP
-                return "A"
-
-    return None
-
+st.markdown("</div>", unsafe_allow_html=True)
 
 # ============================================================
-# UI DRAWING HELPERS  (Glassmorphic Overlay)
+# EVENT LOOP / RERUN TRIGGER
 # ============================================================
-def draw_glass_panel(image, x, y, w, h, color=(40, 40, 40), alpha=0.55):
-    """Draw a translucent rounded-rectangle panel (glassmorphism effect)."""
-    overlay = image.copy()
-    cv2.rectangle(overlay, (x, y), (x + w, y + h), color, -1)
-    cv2.addWeighted(overlay, alpha, image, 1 - alpha, 0, image)
-    # Subtle border
-    cv2.rectangle(image, (x, y), (x + w, y + h), (120, 120, 120), 1)
-
-
-def draw_progress_arc(image, center, radius, progress, thickness=6):
-    """Draw a circular progress arc from 0.0 to 1.0."""
-    # Background circle
-    cv2.circle(image, center, radius, (60, 60, 60), thickness)
-    # Progress arc
-    end_angle = int(360 * progress)
-    if end_angle > 0:
-        cv2.ellipse(image, center, (radius, radius), -90, 0, end_angle,
-                    (0, 230, 118), thickness, cv2.LINE_AA)
-
-
-def draw_hud(image, current_letter, word_buffer, progress,
-             is_speaking, detected_letter, fps):
-    """Draw the full Heads-Up Display overlay."""
-    h, w = image.shape[:2]
-
-    # ---- Top banner ----
-    draw_glass_panel(image, 0, 0, w, 50, color=(20, 20, 20), alpha=0.7)
-    cv2.putText(image, "SignBridge ASL",
-                (15, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
-                (0, 230, 230), 2, cv2.LINE_AA)
-
-    supported = "A B C D E F I K L O U V W Y"
-    cv2.putText(image, supported,
-                (220, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
-                (160, 160, 160), 1, cv2.LINE_AA)
-
-    # FPS counter
-    cv2.putText(image, f"{fps:.0f} FPS",
-                (w - 90, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                (100, 255, 100), 1, cv2.LINE_AA)
-
-    # ---- Current letter + progress arc (top-left) ----
-    if detected_letter:
-        draw_glass_panel(image, 15, 65, 130, 130, alpha=0.5)
-
-        # Large letter
-        cv2.putText(image, detected_letter,
-                    (40, 160), cv2.FONT_HERSHEY_SIMPLEX, 3.0,
-                    (255, 255, 255), 4, cv2.LINE_AA)
-
-        # Progress arc around the letter
-        if progress > 0 and not is_speaking:
-            draw_progress_arc(image, (80, 130), 55, progress)
-
-        if is_speaking:
-            cv2.putText(image, "SPOKEN",
-                        (30, 185), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                        (0, 200, 255), 1, cv2.LINE_AA)
-
-    # ---- Word buffer panel (bottom) ----
-    panel_h = 70
-    draw_glass_panel(image, 0, h - panel_h, w, panel_h,
-                     color=(25, 25, 25), alpha=0.7)
-
-    cv2.putText(image, "WORD:",
-                (15, h - panel_h + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                (0, 200, 255), 1, cv2.LINE_AA)
-
-    display_word = word_buffer if word_buffer else "_"
-    cv2.putText(image, display_word,
-                (90, h - panel_h + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                (255, 255, 255), 2, cv2.LINE_AA)
-
-    # Controls hint
-    controls = "FIST=Space  |  Open Palm(B)=Speak Word  |  ESC=Exit"
-    cv2.putText(image, controls,
-                (15, h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
-                (140, 140, 140), 1, cv2.LINE_AA)
-
-
-# ============================================================
-# MAIN LOOP
-# ============================================================
-def main():
-    mp_hands = mp.solutions.hands
-    mp_drawing = mp.solutions.drawing_utils
-
-
-    cap = cv2.VideoCapture(0)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-
-    # Smoothing history
-    history = deque(maxlen=12)
-
-    # State tracking
-    current_letter = None
-    letter_start_time = None
-    already_spoken = False
-    hold_duration = 2.0  # seconds to hold before accepting a letter
-
-    # Word building
-    word_buffer = ""
-
-
-    # FPS tracking
-    prev_time = time.time()
-    fps = 0.0
-
-    with mp_hands.Hands(
-        model_complexity=0,
-        min_detection_confidence=0.7,
-        min_tracking_confidence=0.7,
-        max_num_hands=1
-    ) as hands:
-
-        while cap.isOpened():
-            success, frame = cap.read()
-            if not success:
-                continue
-
-            # Flip for selfie-view
-            frame = cv2.flip(frame, 1)
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-            rgb.flags.writeable = False
-            results = hands.process(rgb)
-            rgb.flags.writeable = True
-
-            image = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-
-            raw_letter = None
-
-            if results.multi_hand_landmarks and results.multi_handedness:
-                for hand_lm, hand_info in zip(
-                        results.multi_hand_landmarks,
-                        results.multi_handedness):
-                    # Draw the hand skeleton with custom colors
-                    mp_drawing.draw_landmarks(
-                        image, hand_lm,
-                        mp_hands.HAND_CONNECTIONS,
-                        mp_drawing.DrawingSpec(
-                            color=(0, 230, 230), thickness=2, circle_radius=3),
-                        mp_drawing.DrawingSpec(
-                            color=(50, 50, 50), thickness=2))
-
-                    label = hand_info.classification[0].label
-                    raw_letter = classify_gesture(hand_lm, label)
-
-            history.append(raw_letter)
-
-            # --- Smoothing: require 7/12 frames agreement ---
-            counter = Counter(history)
-            most_common = counter.most_common(1)
-            if most_common:
-                smoothed, count = most_common[0]
-                detected_letter = smoothed if (count >= 7
-                                               and smoothed is not None) else None
-            else:
-                detected_letter = None
-
-            # --- FPS ---
-            now = time.time()
-            fps = 0.9 * fps + 0.1 * (1.0 / max(now - prev_time, 0.001))
-            prev_time = now
-
-            # --- Letter hold + word building logic ---
-            progress = 0.0
-            is_speaking = False
-
-            if detected_letter:
-                if detected_letter == current_letter:
-                    if not already_spoken and letter_start_time is not None:
-                        elapsed = now - letter_start_time
-                        progress = min(1.0, elapsed / hold_duration)
-
-                        if elapsed >= hold_duration:
-                            # Letter confirmed — add to word
-                            word_buffer += detected_letter
-
-                            # Speak the individual letter
-                            speak_text(f"Letter {detected_letter}")
-                            already_spoken = True
-                            is_speaking = True
-                else:
-                    current_letter = detected_letter
-                    letter_start_time = now
-                    already_spoken = False
-            else:
-                if current_letter is not None:
-                    current_letter = None
-                    letter_start_time = None
-                    already_spoken = False
-
-            # --- Special gestures for word control ---
-            # SPACE: Closed fist (A sign) held for 1.5s when word is not empty
-            # We detect "no letter" + fist heuristic via the 'A' detection
-            # Actually, let's use a separate approach:
-            # If detected_letter == 'A' and word_buffer is not empty,
-            # holding 'A' for 1.5s adds a space.
-
-            # SPEAK WORD: If 'B' (open palm) is held for 2.5s, speak the whole word
-            # This is handled naturally — when B is spoken, we can also trigger
-            # word speech if the word is long enough.
-
-            # Keyboard shortcuts for word control (while camera window focused)
-            key = cv2.waitKey(5) & 0xFF
-            if key == 27:  # ESC
-                break
-            elif key == ord(' '):  # Space bar → add space to word
-                word_buffer += " "
-            elif key == 8 or key == ord('\b'):  # Backspace → delete last char
-                word_buffer = word_buffer[:-1]
-            elif key == 13 or key == ord('\r'):  # Enter → speak the whole word
-                if word_buffer.strip():
-                    speak_text(word_buffer)
-                    word_buffer = ""
-
-            # --- Draw the HUD ---
-            draw_hud(image, current_letter, word_buffer,
-                     progress, is_speaking, detected_letter, fps)
-
-            cv2.imshow('SignBridge ASL Recognizer', image)
-
-    cap.release()
-    cv2.destroyAllWindows()
-
-
-if __name__ == '__main__':
-    main()
+if webrtc_ctx.state.playing and webrtc_ctx.video_processor:
+    processor = webrtc_ctx.video_processor
+    
+    # Poll the queue for new letters
+    state_changed = False
+    try:
+        while True:
+            new_letter = processor.result_queue.get_nowait()
+            st.session_state.word_buffer += new_letter
+            speak_text(f"{new_letter}")
+            state_changed = True
+    except queue.Empty:
+        pass
+    
+    # Update word buffer UI if new letter came in
+    if state_changed:
+        display_word = st.session_state.word_buffer if st.session_state.word_buffer else "_"
+        word_placeholder.markdown(f"<div class='word-buffer'>{display_word}</div>", unsafe_allow_html=True)
+    
+    # Update HUD with current real-time stats
+    dl = processor.detected_letter
+    prog = processor.progress
+    
+    if dl:
+        letter_placeholder.markdown(f"<div class='hud-letter'>{dl}</div>", unsafe_allow_html=True)
+    else:
+        letter_placeholder.markdown("<div class='hud-letter' style='color: rgba(255,255,255,0.1);'>-</div>", unsafe_allow_html=True)
+        
+    progress_placeholder.progress(prog)
+    
+    # Auto-rerun to keep the UI in sync with the WebRTC thread
+    time.sleep(0.5)
+    st.rerun()

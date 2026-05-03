@@ -1,4 +1,7 @@
+streamlit
+streamlit-webrtc
 opencv-python
 mediapipe
 pyttsx3
 numpy
+av
